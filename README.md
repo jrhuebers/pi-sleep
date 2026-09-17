@@ -13,9 +13,11 @@ sleep({
 })
 ```
 
-The returned message is added as the tool result after the wait. Cancelling the
-agent cancels the timer and reports an aborted sleep. The maximum duration is
-the largest timeout supported by Node.js.
+The message is shown in the tool call immediately and added as the tool
+result after the wait. Cancelling the agent cancels the timer and reports an
+aborted sleep. In the TUI, durations are shown as seconds below a minute,
+`Nmin` for whole minutes, `Nh` for whole hours, and `HH:MM:SS` otherwise. The
+maximum duration is the largest timeout supported by Node.js.
 
 Install with:
 

@@ -4,6 +4,25 @@ import { Type } from "typebox";
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
 
+function formatDuration(seconds: number): string {
+	if (!Number.isFinite(seconds)) return "?s";
+	if (seconds < 60) return `${seconds}s`;
+
+	const totalSeconds = Math.max(0, Math.round(seconds));
+	const minutes = Math.floor(totalSeconds / 60);
+	const remainingSeconds = totalSeconds % 60;
+
+	if (totalSeconds < 3_600 && remainingSeconds === 0) return `${minutes}min`;
+
+	const hours = Math.floor(totalSeconds / 3_600);
+	const remainingMinutes = Math.floor((totalSeconds % 3_600) / 60);
+	if (remainingMinutes === 0 && remainingSeconds === 0) return `${hours}h`;
+
+	return [hours, remainingMinutes, remainingSeconds]
+		.map((part) => part.toString().padStart(2, "0"))
+		.join(":");
+}
+
 function wait(milliseconds: number, signal?: AbortSignal): Promise<void> {
 	return new Promise((resolve, reject) => {
 		let settled = false;
@@ -46,8 +65,15 @@ export default function sleepExtension(pi: ExtensionAPI): void {
 			message: Type.String({ description: "Message to inject into the session when the wait ends." }),
 		}),
 		renderCall(args, theme) {
-			const seconds = typeof args.seconds === "number" ? `${args.seconds}s` : "?s";
-			return new Text(theme.fg("toolTitle", theme.bold("sleep ")) + theme.fg("muted", seconds), 0, 0);
+			const duration = typeof args.seconds === "number" ? formatDuration(args.seconds) : "?s";
+			const message = typeof args.message === "string" ? args.message.trim() : "?";
+			return new Text(
+				theme.fg("toolTitle", theme.bold("sleep ")) +
+					theme.fg("muted", duration) +
+					theme.fg("dim", `: ${JSON.stringify(message)}`),
+				0,
+				0,
+			);
 		},
 
 		renderResult(result, _options, theme) {
