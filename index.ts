@@ -21,6 +21,11 @@ function formatDuration(seconds: number): string {
 	const hours = Math.floor(totalSeconds / 3_600);
 	const remainingMinutes = Math.floor((totalSeconds % 3_600) / 60);
 	if (remainingMinutes === 0 && remainingSeconds === 0) return `${hours}h`;
+	if (totalSeconds < 3_600) {
+		return [minutes, remainingSeconds]
+			.map((part) => part.toString().padStart(2, "0"))
+			.join(":");
+	}
 
 	return [hours, remainingMinutes, remainingSeconds]
 		.map((part) => part.toString().padStart(2, "0"))
