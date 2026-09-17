@@ -4,6 +4,11 @@ import { Type } from "typebox";
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
 
+type SleepRenderState = {
+	startedAt?: number;
+	timer?: ReturnType<typeof setInterval>;
+};
+
 function formatDuration(seconds: number): string {
 	if (!Number.isFinite(seconds)) return "?s";
 	if (seconds < 60) return `${seconds}s`;
@@ -11,13 +16,34 @@ function formatDuration(seconds: number): string {
 	const totalSeconds = Math.max(0, Math.round(seconds));
 	const minutes = Math.floor(totalSeconds / 60);
 	const remainingSeconds = totalSeconds % 60;
-
 	if (totalSeconds < 3_600 && remainingSeconds === 0) return `${minutes}min`;
 
 	const hours = Math.floor(totalSeconds / 3_600);
 	const remainingMinutes = Math.floor((totalSeconds % 3_600) / 60);
 	if (remainingMinutes === 0 && remainingSeconds === 0) return `${hours}h`;
 
+	return [hours, remainingMinutes, remainingSeconds]
+		.map((part) => part.toString().padStart(2, "0"))
+		.join(":");
+}
+
+function formatProgressDuration(seconds: number, includeHours: boolean, includeMinutes: boolean): string {
+	const empty = includeHours ? "--:--:--" : includeMinutes ? "--:--" : "--";
+	if (!Number.isFinite(seconds) || seconds < 0) return empty;
+
+	const totalSeconds = Math.round(seconds);
+	const remainingSeconds = totalSeconds % 60;
+	if (!includeMinutes) return remainingSeconds.toString().padStart(2, "0");
+
+	const minutes = Math.floor(totalSeconds / 60);
+	if (!includeHours) {
+		return [minutes, remainingSeconds]
+			.map((part) => part.toString().padStart(2, "0"))
+			.join(":");
+	}
+
+	const hours = Math.floor(totalSeconds / 3_600);
+	const remainingMinutes = Math.floor((totalSeconds % 3_600) / 60);
 	return [hours, remainingMinutes, remainingSeconds]
 		.map((part) => part.toString().padStart(2, "0"))
 		.join(":");
@@ -64,16 +90,41 @@ export default function sleepExtension(pi: ExtensionAPI): void {
 			}),
 			message: Type.String({ description: "Message to inject into the session when the wait ends." }),
 		}),
-		renderCall(args, theme) {
-			const duration = typeof args.seconds === "number" ? formatDuration(args.seconds) : "?s";
+		renderCall(args, theme, context) {
+			const state = context.state as SleepRenderState;
+			const totalSeconds = typeof args.seconds === "number" ? args.seconds : Number.NaN;
+			const includeHours = totalSeconds >= 3_600;
+			const includeMinutes = totalSeconds >= 60;
+			const duration = formatDuration(totalSeconds);
 			const message = typeof args.message === "string" ? args.message.trim() : "?";
-			return new Text(
+
+			if (context.executionStarted && state.startedAt === undefined) {
+				state.startedAt = Date.now();
+			}
+			if (context.executionStarted && context.isPartial && state.timer === undefined) {
+				state.timer = setInterval(() => context.invalidate(), 1_000);
+			}
+			if (!context.isPartial && state.timer !== undefined) {
+				clearInterval(state.timer);
+				state.timer = undefined;
+			}
+
+			const elapsed = !context.isPartial && !context.isError
+				? duration
+				: state.startedAt === undefined
+					? formatProgressDuration(0, includeHours, includeMinutes)
+					: formatProgressDuration(
+						Math.min(totalSeconds, Math.floor((Date.now() - state.startedAt) / 1_000)),
+						includeHours,
+						includeMinutes,
+					);
+			const component = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+			component.setText(
 				theme.fg("toolTitle", theme.bold("sleep ")) +
-					theme.fg("muted", duration) +
+					theme.fg("muted", `${elapsed}/${duration}`) +
 					theme.fg("dim", `: ${JSON.stringify(message)}`),
-				0,
-				0,
 			);
+			return component;
 		},
 
 		renderResult(result, _options, theme) {
