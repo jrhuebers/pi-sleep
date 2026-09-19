@@ -29,8 +29,10 @@ Cancelling the agent cancels the timer and reports an aborted sleep.
 When `pi-background-tasks` is installed, `background_job_ids` is available; when
 `pi-slurm` is installed, `slurm_job_ids` is available.  Supplying either field
 interrupts the sleep as soon as any listed job exits (or, for Slurm, reaches a
-terminal state). The result identifies the job that interrupted it and says how
-long the sleep actually lasted; its structured details also include
+terminal state). Completion events are tracked for the whole session, so a job
+that finished just before the sleep call still interrupts immediately. The
+result identifies the job that interrupted it and says how long the sleep
+actually lasted; its structured details also include
 `interrupted_after_seconds`. The fields are omitted from the tool schema when
 their companion extension is absent.
 

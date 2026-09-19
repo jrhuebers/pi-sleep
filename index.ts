@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
@@ -27,6 +27,85 @@ type SleepParams = {
 	background_job_ids?: string[];
 	slurm_job_ids?: string[];
 };
+
+type SleepWaiter = {
+	jobs: WatchedJob[];
+	finish: (job?: WatchedJob) => void;
+	abort: () => void;
+};
+
+type SleepTracker = {
+	finished: Map<string, WatchedJob>;
+	waiters: Set<SleepWaiter>;
+};
+
+function jobKey(job: WatchedJob): string {
+	return `${job.source}:${job.id}`;
+}
+
+function eventJob(source: WatchedJob["source"], event: unknown): WatchedJob | undefined {
+	if (typeof event !== "object" || event === null || typeof (event as { id?: unknown }).id !== "string") return undefined;
+	return {
+		id: (event as { id: string }).id,
+		source,
+		event: source === "background" ? "background-tasks:finished" : "slurm:finished",
+	};
+}
+
+function rememberFinished(tracker: SleepTracker, job: WatchedJob): void {
+	tracker.finished.set(jobKey(job), job);
+	while (tracker.finished.size > 4_096) {
+		const oldest = tracker.finished.keys().next().value as string | undefined;
+		if (oldest === undefined) break;
+		tracker.finished.delete(oldest);
+	}
+	for (const waiter of [...tracker.waiters]) {
+		if (waiter.jobs.some((watched) => jobKey(watched) === jobKey(job))) waiter.finish(job);
+	}
+}
+
+function createSleepTracker(pi: ExtensionAPI): SleepTracker {
+	const tracker: SleepTracker = { finished: new Map(), waiters: new Set() };
+	pi.events.on("background-tasks:finished", (data) => {
+		const job = eventJob("background", data);
+		if (job) rememberFinished(tracker, job);
+	});
+	pi.events.on("slurm:finished", (data) => {
+		const job = eventJob("slurm", data);
+		if (job) rememberFinished(tracker, job);
+	});
+	return tracker;
+}
+
+function abortTrackedSleeps(tracker: SleepTracker): void {
+	for (const waiter of [...tracker.waiters]) waiter.abort();
+	tracker.finished.clear();
+}
+
+function persistedFinishedJobs(ctx: ExtensionContext, jobs: WatchedJob[]): WatchedJob[] {
+	const entries = ctx.sessionManager.getEntries() as Array<{ type?: string; customType?: string; data?: unknown }>;
+	const latest = (customType: string): Record<string, unknown> | undefined => {
+		const data = [...entries].reverse().find((entry) => entry.type === "custom" && entry.customType === customType)?.data;
+		return typeof data === "object" && data !== null ? data as Record<string, unknown> : undefined;
+	};
+	const backgroundState = latest("pi-background-tasks-state");
+	const finishedBackground = new Set(
+		Array.isArray(backgroundState?.finishedJobIds)
+			? backgroundState.finishedJobIds.filter((id): id is string => typeof id === "string")
+			: [],
+	);
+	const slurmState = latest("pi-research-engineer-slurm-state");
+	const terminalSlurm = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]);
+	const slurmJobs = Array.isArray(slurmState?.jobs) ? slurmState.jobs : [];
+	return jobs.filter((job) => {
+		if (job.source === "background") return finishedBackground.has(job.id);
+		return slurmJobs.some((value) => {
+			if (typeof value !== "object" || value === null) return false;
+			const candidate = value as { id?: unknown; lastState?: unknown };
+			return candidate.id === job.id && typeof candidate.lastState === "string" && terminalSlurm.has(candidate.lastState);
+		});
+	});
+}
 
 function formatDuration(seconds: number): string {
 	if (!Number.isFinite(seconds)) return "?s";
@@ -101,14 +180,13 @@ function watchedIds(ids: string[] | undefined, field: string): string[] {
 	return [...unique];
 }
 
-function waitForSleep(milliseconds: number, pi: ExtensionAPI, jobs: WatchedJob[], signal?: AbortSignal): Promise<WatchedJob | undefined> {
+function waitForSleep(milliseconds: number, tracker: SleepTracker, jobs: WatchedJob[], signal?: AbortSignal): Promise<WatchedJob | undefined> {
 	return new Promise((resolve, reject) => {
 		let settled = false;
 		let timer: ReturnType<typeof setTimeout> | undefined;
-		const unsubscribers: Array<() => void> = [];
 		const cleanup = () => {
 			if (timer) clearTimeout(timer);
-			for (const unsubscribe of unsubscribers) unsubscribe();
+			tracker.waiters.delete(waiter);
 			if (signal) signal.removeEventListener("abort", abort);
 		};
 		const finish = (job?: WatchedJob) => {
@@ -123,19 +201,36 @@ function waitForSleep(milliseconds: number, pi: ExtensionAPI, jobs: WatchedJob[]
 			cleanup();
 			reject(new Error("Sleep aborted."));
 		};
+		const waiter: SleepWaiter = { jobs, finish, abort };
+		const alreadyFinished = () => jobs
+			.map((job) => tracker.finished.get(jobKey(job)))
+			.find((job): job is WatchedJob => job !== undefined);
 
-		for (const job of jobs) {
-			unsubscribers.push(pi.events.on(job.event, (data) => {
-				if (typeof data === "object" && data !== null && (data as { id?: unknown }).id === job.id) finish(job);
-			}));
+		// The tracker is subscribed for the whole session, so completion events
+		// that happened before this tool call are still observable here.
+		const completedBeforeWait = alreadyFinished();
+		if (completedBeforeWait) {
+			finish(completedBeforeWait);
+			return;
 		}
+
+		tracker.waiters.add(waiter);
+		// Recheck after registration to make the ordering guarantee explicit.
+		// JavaScript callbacks cannot interleave between the two synchronous
+		// operations above, but this also protects future refactors.
+		const completedAfterRegistration = alreadyFinished();
+		if (completedAfterRegistration) {
+			finish(completedAfterRegistration);
+			return;
+		}
+
 		timer = setTimeout(() => finish(), milliseconds);
 		if (signal?.aborted) abort();
 		else signal?.addEventListener("abort", abort, { once: true });
 	});
 }
 
-function registerSleepTool(pi: ExtensionAPI, features: SleepFeatures): void {
+function registerSleepTool(pi: ExtensionAPI, features: SleepFeatures, tracker: SleepTracker): void {
 	const properties = {
 		seconds: Type.Number({
 			exclusiveMinimum: 0,
@@ -218,7 +313,7 @@ function registerSleepTool(pi: ExtensionAPI, features: SleepFeatures): void {
 			return new Text(theme.fg("success", "✓ ") + theme.fg("dim", summary), 0, 0);
 		},
 
-		async execute(_toolCallId, rawParams, signal) {
+		async execute(_toolCallId, rawParams, signal, _onUpdate, ctx: ExtensionContext) {
 			const params = rawParams as SleepParams;
 			if (!Number.isFinite(params.seconds) || params.seconds <= 0) {
 				throw new Error("seconds must be a positive finite number.");
@@ -234,8 +329,9 @@ function registerSleepTool(pi: ExtensionAPI, features: SleepFeatures): void {
 				...backgroundJobIds.map((id) => ({ id, source: "background" as const, event: "background-tasks:finished" })),
 				...slurmJobIds.map((id) => ({ id, source: "slurm" as const, event: "slurm:finished" })),
 			];
+			for (const job of persistedFinishedJobs(ctx, watchedJobs)) rememberFinished(tracker, job);
 			const startedAt = Date.now();
-			const interruptedBy = await waitForSleep(Math.round(params.seconds * 1_000), pi, watchedJobs, signal);
+			const interruptedBy = await waitForSleep(Math.round(params.seconds * 1_000), tracker, watchedJobs, signal);
 			const interruptedAfterSeconds = Math.min(params.seconds, (Date.now() - startedAt) / 1_000);
 			const text = interruptedBy
 				? `Sleep interrupted after ${formatElapsedSeconds(interruptedAfterSeconds)} because ${interruptedBy.source} job ${interruptedBy.id} exited. ${message}`
@@ -255,11 +351,16 @@ function registerSleepTool(pi: ExtensionAPI, features: SleepFeatures): void {
 }
 
 export default function sleepExtension(pi: ExtensionAPI): void {
+	// Subscribe during extension loading, before any session_start handlers can
+	// restore jobs and emit terminal events. The old implementation subscribed
+	// only inside execute(), which dropped completions that happened earlier.
+	const tracker = createSleepTracker(pi);
+	pi.on("session_shutdown", () => abortTrackedSleeps(tracker));
 	pi.on("session_start", () => {
 		const toolNames = new Set(pi.getAllTools().map((tool) => tool.name));
 		registerSleepTool(pi, {
 			backgroundTasks: toolNames.has("jobs"),
 			slurm: toolNames.has("slurm_submit"),
-		});
+		}, tracker);
 	});
 }
