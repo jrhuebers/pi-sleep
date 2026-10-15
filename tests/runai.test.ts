@@ -12,7 +12,7 @@ async function setup(sleepFirst: boolean) {
   const runai = (await import(pathToFileURL(resolve(source!)).href)).default;
   const h = harness([]);
   if (sleepFirst) h.loadSleep();
-  runai(h.api);
+  runai(h.api, { capture: h.capture });
   if (!sleepFirst) h.loadSleep();
   return h;
 }

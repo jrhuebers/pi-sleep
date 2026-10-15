@@ -1,4 +1,8 @@
 import { EventEmitter } from "node:events";
+import { mkdtempSync, writeFileSync, appendFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { randomBytes } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import sleep from "../index.js";
 
@@ -6,6 +10,7 @@ export function harness(companions: string[] = ["runai_submit"]) {
   const handlers = new Map<string, Function[]>();
   const tools = new Map<string, any>(companions.map(name => [name, { name }]));
   const events = new EventEmitter();
+  const root = mkdtempSync(join(tmpdir(), "sleep-harness-"));
   let entries: any[] = [];
   const rows = new Map<string, string>();
   const commands: string[][] = [];
@@ -26,16 +31,26 @@ export function harness(companions: string[] = ["runai_submit"]) {
       return { stdout, stderr: "", code: 0, killed: false };
     },
   } as unknown as ExtensionAPI;
-  const ctx = { hasUI: false, sessionManager: { getBranch: () => entries } };
+  const ctx = { cwd: root, hasUI: false, sessionManager: { getBranch: () => entries } };
   async function fire(name: string) { for (const handler of handlers.get(name) ?? []) await handler({}, ctx); }
   return {
     api, tools, events, rows, commands, ctx,
+    capture: {
+      create(_cwd: string, name: string) {
+        const file = join(root, `${name}-${randomBytes(8).toString("hex")}.out`);
+        writeFileSync(file, "", { mode: 0o600 });
+        return file;
+      },
+      async follow() {},
+      async finish(job: { logPath?: string }) { if (job.logPath) appendFileSync(job.logPath, "mock log\n"); },
+      stopAll() {}, stopJob() {},
+    },
     loadSleep: () => sleep(api),
     setBranch: (value: any[]) => { entries = value; },
     getBranch: () => entries,
     fire,
     start: () => fire("session_start"),
-    stop: () => fire("session_shutdown"),
+    async stop() { await fire("session_shutdown"); rmSync(root, { recursive: true, force: true }); },
     call(name: string, params: unknown, signal?: AbortSignal) {
       return tools.get(name).execute("test", params, signal, undefined, ctx);
     },
