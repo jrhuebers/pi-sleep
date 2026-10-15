@@ -13,11 +13,12 @@ type SleepRenderState = {
 type SleepFeatures = {
 	backgroundTasks: boolean;
 	slurm: boolean;
+	runai: boolean;
 };
 
 type WatchedJob = {
 	id: string;
-	source: "background" | "slurm";
+	source: "background" | "slurm" | "runai";
 	event: string;
 };
 
@@ -26,6 +27,7 @@ type SleepParams = {
 	message: string;
 	background_job_ids?: string[];
 	slurm_job_ids?: string[];
+	runai_job_ids?: string[];
 };
 
 type SleepWaiter = {
@@ -48,7 +50,7 @@ function eventJob(source: WatchedJob["source"], event: unknown): WatchedJob | un
 	return {
 		id: (event as { id: string }).id,
 		source,
-		event: source === "background" ? "background-tasks:finished" : "slurm:finished",
+		event: source === "background" ? "background-tasks:finished" : `${source}:finished`,
 	};
 }
 
@@ -74,6 +76,10 @@ function createSleepTracker(pi: ExtensionAPI): SleepTracker {
 		const job = eventJob("slurm", data);
 		if (job) rememberFinished(tracker, job);
 	});
+	pi.events.on("runai:finished", (data) => {
+		const job = eventJob("runai", data);
+		if (job) rememberFinished(tracker, job);
+	});
 	return tracker;
 }
 
@@ -83,7 +89,7 @@ function abortTrackedSleeps(tracker: SleepTracker): void {
 }
 
 function persistedFinishedJobs(ctx: ExtensionContext, jobs: WatchedJob[]): WatchedJob[] {
-	const entries = ctx.sessionManager.getEntries() as Array<{ type?: string; customType?: string; data?: unknown }>;
+	const entries = ctx.sessionManager.getBranch() as Array<{ type?: string; customType?: string; data?: unknown }>;
 	const latest = (customType: string): Record<string, unknown> | undefined => {
 		const data = [...entries].reverse().find((entry) => entry.type === "custom" && entry.customType === customType)?.data;
 		return typeof data === "object" && data !== null ? data as Record<string, unknown> : undefined;
@@ -97,12 +103,17 @@ function persistedFinishedJobs(ctx: ExtensionContext, jobs: WatchedJob[]): Watch
 	const slurmState = latest("pi-research-engineer-slurm-state");
 	const terminalSlurm = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]);
 	const slurmJobs = Array.isArray(slurmState?.jobs) ? slurmState.jobs : [];
+	const runaiState = latest("pi-runai-state");
+	const terminalRunai = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
+	const runaiJobs = runaiState?.version === 1 && Array.isArray(runaiState.jobs) ? runaiState.jobs : [];
 	return jobs.filter((job) => {
 		if (job.source === "background") return finishedBackground.has(job.id);
-		return slurmJobs.some((value) => {
+		const candidates = job.source === "slurm" ? slurmJobs : runaiJobs;
+		const terminal = job.source === "slurm" ? terminalSlurm : terminalRunai;
+		return candidates.some((value) => {
 			if (typeof value !== "object" || value === null) return false;
 			const candidate = value as { id?: unknown; lastState?: unknown };
-			return candidate.id === job.id && typeof candidate.lastState === "string" && terminalSlurm.has(candidate.lastState);
+			return candidate.id === job.id && typeof candidate.lastState === "string" && terminal.has(candidate.lastState);
 		});
 	});
 }
@@ -164,6 +175,9 @@ function formatInterruptTargets(args: SleepParams): string | undefined {
 			: undefined,
 		Array.isArray(args.slurm_job_ids) && args.slurm_job_ids.length > 0
 			? `Slurm: ${args.slurm_job_ids.join(", ")}`
+			: undefined,
+		Array.isArray(args.runai_job_ids) && args.runai_job_ids.length > 0
+			? `Run:ai: ${args.runai_job_ids.join(", ")}`
 			: undefined,
 	].filter((target): target is string => target !== undefined);
 	return targets.length > 0 ? `interrupt on exit — ${targets.join("; ")}` : undefined;
@@ -250,6 +264,12 @@ function registerSleepTool(pi: ExtensionAPI, features: SleepFeatures, tracker: S
 				description: "Optional pi-slurm job IDs. Interrupt the sleep when any listed job reaches a terminal state.",
 			})),
 		} : {}),
+		...(features.runai ? {
+			runai_job_ids: Type.Optional(Type.Array(Type.String({ minLength: 1 }), {
+				minItems: 1,
+				description: "Optional pi-runai tracked IDs (cluster/project/name). Interrupt the sleep when any listed job completes, fails or is cancelled.",
+			})),
+		} : {}),
 	};
 
 	pi.registerTool({
@@ -304,12 +324,12 @@ function registerSleepTool(pi: ExtensionAPI, features: SleepFeatures, tracker: S
 		},
 
 		renderResult(result, _options, theme) {
-			const interruptedBy = (result.details as { interruptedBy?: { source: "background" | "slurm"; jobId: string } } | undefined)?.interruptedBy;
+			const interruptedBy = (result.details as { interruptedBy?: { source: WatchedJob["source"]; jobId: string } } | undefined)?.interruptedBy;
 			const summary = !interruptedBy
 				? "Sleep completed."
 				: interruptedBy.source === "background"
 					? `Sleep interrupted early because background job ${interruptedBy.jobId} exited.`
-					: `Sleep interrupted early because Slurm job ${interruptedBy.jobId} reached a terminal state.`;
+					: `Sleep interrupted early because ${interruptedBy.source === "slurm" ? "Slurm" : "Run:ai"} job ${interruptedBy.jobId} reached a terminal state.`;
 			return new Text(theme.fg("success", "✓ ") + theme.fg("dim", summary), 0, 0);
 		},
 
@@ -322,12 +342,15 @@ function registerSleepTool(pi: ExtensionAPI, features: SleepFeatures, tracker: S
 			if (!message) throw new Error("message must not be empty.");
 			const backgroundJobIds = watchedIds(params.background_job_ids, "background_job_ids");
 			const slurmJobIds = watchedIds(params.slurm_job_ids, "slurm_job_ids");
+			const runaiJobIds = watchedIds(params.runai_job_ids, "runai_job_ids");
 			if (backgroundJobIds.length > 0 && !features.backgroundTasks) throw new Error("background_job_ids requires pi-background-tasks.");
 			if (slurmJobIds.length > 0 && !features.slurm) throw new Error("slurm_job_ids requires pi-slurm.");
+			if (runaiJobIds.length > 0 && !features.runai) throw new Error("runai_job_ids requires pi-runai.");
 
 			const watchedJobs: WatchedJob[] = [
 				...backgroundJobIds.map((id) => ({ id, source: "background" as const, event: "background-tasks:finished" })),
 				...slurmJobIds.map((id) => ({ id, source: "slurm" as const, event: "slurm:finished" })),
+				...runaiJobIds.map((id) => ({ id, source: "runai" as const, event: "runai:finished" })),
 			];
 			for (const job of persistedFinishedJobs(ctx, watchedJobs)) rememberFinished(tracker, job);
 			const startedAt = Date.now();
@@ -356,11 +379,13 @@ export default function sleepExtension(pi: ExtensionAPI): void {
 	// only inside execute(), which dropped completions that happened earlier.
 	const tracker = createSleepTracker(pi);
 	pi.on("session_shutdown", () => abortTrackedSleeps(tracker));
+	pi.on("session_tree", () => abortTrackedSleeps(tracker));
 	pi.on("session_start", () => {
 		const toolNames = new Set(pi.getAllTools().map((tool) => tool.name));
 		registerSleepTool(pi, {
 			backgroundTasks: toolNames.has("jobs"),
 			slurm: toolNames.has("slurm_submit"),
+			runai: toolNames.has("runai_submit"),
 		}, tracker);
 	});
 }
